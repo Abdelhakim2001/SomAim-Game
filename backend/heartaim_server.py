@@ -12,11 +12,12 @@ ecg_buffer   = deque(maxlen=BUFFER_SIZE)
 rr_intervals = deque(maxlen=300)
 game_clients = set()
 
-# Charger le modèle CNN entraîné
+# Charger le modèle CNN
 from heartaim_finetune import StressPredictor
 predictor = StressPredictor('heartaim_stress_model.pt')
 print("Modele CNN charge ✓")
 
+# ── HRV ──────────────────────────────────────────────
 def detect_rpeaks():
     import neurokit2 as nk
     if len(ecg_buffer) < BUFFER_SIZE:
@@ -32,18 +33,14 @@ def detect_rpeaks():
     except:
         pass
 
-def compute_hr():
-    if len(rr_intervals) < 2:
-        return 0
-    return round(60000 / np.mean(list(rr_intervals)[-10:]))
-
 def compute_hrv_rmssd():
     if len(rr_intervals) < 5:
-        return 0
+        return 0.0
     rr    = np.array(rr_intervals)
     rmssd = np.sqrt(np.mean(np.diff(rr) ** 2))
     return round(float(rmssd), 2)
 
+# ── BROADCAST ────────────────────────────────────────
 async def broadcast(data):
     if not game_clients:
         return
@@ -56,88 +53,100 @@ async def broadcast(data):
             dead.add(c)
     game_clients -= dead
 
+# ── HANDLER ESP32 ────────────────────────────────────
 async def handle_esp(ws, path):
     print(f"[ESP32] Connecte: {ws.remote_address}")
     counter = 0
     try:
         async for msg in ws:
             d = json.loads(msg)
+
             if not d.get("connected"):
+                print("Electrodes deconnectees")
                 continue
 
-            ecg_buffer.append(d["ecg"])
+            # Données reçues depuis ESP32
+            ecg_value  = d.get("ecg", 0)
+            bpm_esp    = d.get("bpm", 0)
+            status_esp = d.get("heart_status", "Normal")  # High / Normal / Low
+
+            ecg_buffer.append(ecg_value)
             counter += 1
 
-            # Analyser toutes les 50 samples (0.5 seconde)
+            # Analyser toutes les 50 samples (0.5s)
             if counter % 50 == 0:
                 detect_rpeaks()
-
-                hr    = compute_hr()
                 rmssd = compute_hrv_rmssd()
 
-                # Prédiction CNN sur le signal brut
+                # Prédiction CNN
                 if len(ecg_buffer) >= BUFFER_SIZE:
-                    result = predictor.predict(list(ecg_buffer))
-                    state  = result['state']   # CALM ou STRESS
-                    conf   = result['confidence']
+                    result    = predictor.predict(list(ecg_buffer))
+                    cnn_state = result['state']
+                    cnn_conf  = result['confidence']
                 else:
-                    state = "NORMAL"
-                    conf  = 0.0
+                    cnn_state = "NORMAL"
+                    cnn_conf  = 0.0
 
-                # Mapper vers HIGH / NORMAL / LOW
-                # basé sur HR + HRV + CNN
-                if hr > 0:
-                    if hr < 65 and rmssd > 40:
-                        heart_state = "HIGH"    # calme, HRV élevé
-                        speed = 1.0
-                    elif hr > 90 or rmssd < 15:
-                        heart_state = "LOW"     # stressé, HRV faible
-                        speed = 0.2
-                    else:
-                        heart_state = "NORMAL"
-                        speed = 0.6
+                # Décision finale :
+                # Priority 1 → BPM direct de l'ESP32
+                # Priority 2 → CNN si BPM pas encore dispo
+                if bpm_esp > 0:
+                    heart_state = status_esp.upper()  # HIGH / NORMAL / LOW
+                    speed_map   = {"HIGH": 1.0, "NORMAL": 0.6, "LOW": 0.2}
+                    speed       = speed_map.get(heart_state, 0.6)
                 else:
-                    # Fallback sur CNN seul
-                    heart_state = "HIGH" if state == "CALM" else "LOW" if state == "STRESS" else "NORMAL"
-                    speed = {'HIGH': 1.0, 'NORMAL': 0.6, 'LOW': 0.2}[heart_state]
+                    # Fallback CNN
+                    heart_state = "HIGH" if cnn_state == "CALM" else "LOW" if cnn_state == "STRESS" else "NORMAL"
+                    speed       = {"HIGH": 1.0, "NORMAL": 0.6, "LOW": 0.2}[heart_state]
 
                 payload = {
                     "type":        "ecg_update",
-                    "heart_state": heart_state,  # HIGH / NORMAL / LOW
+                    "heart_state": heart_state,
                     "speed":       speed,
-                    "hr":          hr,
+                    "hr":          round(bpm_esp),
                     "rmssd":       rmssd,
-                    "cnn_state":   state,
-                    "confidence":  conf
+                    "cnn_state":   cnn_state,
+                    "confidence":  cnn_conf
                 }
 
                 await broadcast(payload)
-                print(f"HR:{hr}bpm | RMSSD:{rmssd}ms | {heart_state} | speed:{speed} | CNN:{state}({conf})")
+                print(f"BPM:{round(bpm_esp)} | RMSSD:{rmssd} | {heart_state} | speed:{speed} | CNN:{cnn_state}({cnn_conf})")
 
     except websockets.exceptions.ConnectionClosed:
         print("[ESP32] Deconnecte")
 
+# ── HANDLER GAME ─────────────────────────────────────
 async def handle_game(ws, path):
     print(f"[GAME] Connecte: {ws.remote_address}")
     game_clients.add(ws)
     await ws.send(json.dumps({
-        "type": "init", "heart_state": "NORMAL",
-        "speed": 0.6, "hr": 0, "rmssd": 0
+        "type":        "init",
+        "heart_state": "NORMAL",
+        "speed":       0.6,
+        "hr":          0,
+        "rmssd":       0.0,
+        "cnn_state":   "NORMAL",
+        "confidence":  0.0
     }))
     try:
         async for _ in ws:
             pass
     finally:
         game_clients.discard(ws)
+        print("[GAME] Deconnecte")
 
+# ── ROUTER ───────────────────────────────────────────
 async def router(ws, path):
     if path == "/ecg":
         await handle_esp(ws, path)
     else:
         await handle_game(ws, path)
 
+# ── MAIN ─────────────────────────────────────────────
 async def main():
     print(f"HeartAim Server ws://{HOST}:{PORT}")
+    print("ESP32 → ws://IP:8765/ecg")
+    print("Game  → ws://IP:8765/game")
     async with websockets.serve(router, HOST, PORT):
         await asyncio.Future()
 
